@@ -1,0 +1,8 @@
+[Unit]
+Description=Close idle Claude Code sessions in tmux (log: ~/.local/state/tmux-reap/closed.log)
+
+[Service]
+Type=oneshot
+# Tune here, e.g.:
+# Environment=REAP_IDLE_MIN=60 REAP_EXEMPT=orchestrator,notes,hud-listen
+ExecStart=%h/.local/bin/tmux-reap-stale

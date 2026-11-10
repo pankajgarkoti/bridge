@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Start (or attach to) a tmux session whose server lives in its own systemd user scope,
+# so logging out of your desktop, or the desktop crashing, doesn't kill your agents.
+#
+#   tmux-keep [session]        start the server protected if needed, then attach (default session: work)
+#   tmux-keep --adopt          move an already-running tmux server (and everything in it) into the scope
+#   tmux-keep --status         show which scope the tmux server is in
+#
+# For sessions to also survive a full logout (no session left at all), enable lingering once:
+#   loginctl enable-linger "$USER"
+set -euo pipefail
+unit=tmux-keep
+session=work
+
+scope_cgroup() { systemctl --user show -p ControlGroup --value "$unit.scope" 2>/dev/null; }
+server_pid() { tmux display-message -p '#{pid}' 2>/dev/null || true; }
+
+ensure_scope() {
+  # The scope needs a process to exist; a sleeping placeholder holds it open.
+  if ! systemctl --user is-active --quiet "$unit.scope"; then
+    setsid systemd-run --user --scope --unit="$unit" \
+      --description="tmux server, kept across logouts" -- sleep infinity >/dev/null 2>&1 </dev/null &
+    for _ in $(seq 1 20); do systemctl --user is-active --quiet "$unit.scope" && break; sleep 0.1; done
+  fi
+  scope_cgroup
+}
+
+adopt() {
+  local pid cg moved=0
+  pid=$(server_pid)
+  [ -n "$pid" ] || { echo "no tmux server running"; exit 1; }
+  cg=$(ensure_scope)
+  [ -n "$cg" ] || { echo "could not create $unit.scope"; exit 1; }
+  # The server plus every process started inside it (shells, agents, editors).
+  descendants() { echo "$1"; for c in $(cat /proc/"$1"/task/*/children 2>/dev/null); do descendants "$c"; done; }
+  for p in $(descendants "$pid" | sort -u); do
+    [ -d "/proc/$p" ] && echo "$p" > "/sys/fs/cgroup$cg/cgroup.procs" 2>/dev/null && moved=$((moved + 1))
+  done
+  echo "moved $moved processes into $unit.scope"
+}
+
+status() {
+  local pid
+  pid=$(server_pid)
+  [ -n "$pid" ] || { echo "no tmux server running"; return; }
+  echo "tmux server $pid is in: $(sed 's/^0:://' /proc/"$pid"/cgroup)"
+  loginctl show-user "$USER" -p Linger 2>/dev/null || true
+}
+
+case "${1:-}" in
+  --adopt) adopt ;;
+  --status) status ;;
+  -h|--help) sed -n 2,11p "$0" | sed 's/^# \{0,1\}//' ;;
+  *)
+    [ -n "${1:-}" ] && session=$1
+    if [ -z "$(server_pid)" ]; then
+      ensure_scope >/dev/null
+      # Start the server inside the scope by running the first tmux command through it.
+      systemd-run --user --scope --unit="$unit-start-$$" --collect -q -- tmux new-session -d -s "$session"
+      adopt >/dev/null
+    elif ! tmux has-session -t "=$session" 2>/dev/null; then
+      tmux new-session -d -s "$session"
+    fi
+    [ -n "${TMUX:-}" ] && exec tmux switch-client -t "=$session"
+    exec tmux attach -t "=$session"
+    ;;
+esac

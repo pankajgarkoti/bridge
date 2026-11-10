@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Close Claude Code sessions in tmux that have sat idle, so they stop holding memory.
+
+A session is closed only when ALL of these hold:
+  - its process is alive and Claude reports it "idle" (~/.claude/sessions/<pid>.json)
+  - it has been idle for IDLE_MIN minutes (LOW_MEM_IDLE_MIN when memory is short)
+  - its window isn't exempt (the orchestrator, notes, HUD windows)
+  - its pane shows no question, menu or permission prompt waiting on the user
+  - its input box holds no typed draft
+Every close is logged with the resume command, so nothing is lost:
+  ~/.local/state/tmux-reap/closed.log
+
+Usage: tmux-reap-stale [--dry-run]
+Settings (environment): REAP_IDLE_MIN (60), REAP_LOW_MEM_IDLE_MIN (20),
+REAP_LOW_MEM_MB (2500), REAP_EXEMPT (orchestrator,notes,hud-listen).
+
+It relies on the session status files Claude Code writes to ~/.claude/sessions/;
+if a Claude Code update changes that format, it simply closes nothing.
+"""
+import json, os, subprocess, sys, time, re, pathlib
+
+IDLE_MIN = int(os.environ.get("REAP_IDLE_MIN", "60"))
+LOW_MEM_IDLE_MIN = int(os.environ.get("REAP_LOW_MEM_IDLE_MIN", "20"))
+LOW_MEM_MB = int(os.environ.get("REAP_LOW_MEM_MB", "2500"))
+# Window names never closed. Comma-separated in REAP_EXEMPT.
+EXEMPT = set(filter(None, os.environ.get("REAP_EXEMPT", "orchestrator,notes,hud-listen").split(",")))
+WAITING = re.compile(r"Enter to select|Do you want|Allow this|Esc to cancel|\[y/N\]|\(y/n\)", re.I)
+DRY = "--dry-run" in sys.argv
+
+STATE = pathlib.Path.home() / ".local/state/tmux-reap"
+STATE.mkdir(parents=True, exist_ok=True)
+LOG = STATE / "closed.log"
+
+
+def sh(*a):
+    return subprocess.run(a, capture_output=True, text=True).stdout
+
+
+def available_mb():
+    for line in open("/proc/meminfo"):
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) // 1024
+    return 10**6
+
+
+def alive_claude(pid):
+    try:
+        return pathlib.Path(f"/proc/{pid}/comm").read_text().strip() == "claude"
+    except OSError:
+        return False
+
+
+def has_draft(pane):
+    # The prompt line is "❯ <text>". Dim text (ESC[2m) is only a suggestion, not a draft.
+    lines = [l for l in sh("tmux", "capture-pane", "-p", "-e", "-t", pane).splitlines() if "❯" in l]
+    if not lines:
+        return False
+    after = lines[-1].split("❯", 1)[1]
+    if "\x1b[2m" in after:
+        return False
+    return bool(re.sub(r"\x1b\[[0-9;]*m", "", after).strip())
+
+
+def main():
+    limit = LOW_MEM_IDLE_MIN if available_mb() < LOW_MEM_MB else IDLE_MIN
+    now = time.time() * 1000
+    for f in (pathlib.Path.home() / ".claude/sessions").glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except Exception:
+            continue
+        pid, tm = d.get("pid"), d.get("tmux") or ""
+        if not pid or not alive_claude(pid) or d.get("status") != "idle" or "%" not in tm:
+            continue
+        idle_min = (now - d.get("statusUpdatedAt", now)) / 60000
+        if idle_min < limit:
+            continue
+        pane = "%" + tm.split("%", 1)[1]
+        win = sh("tmux", "display-message", "-p", "-t", pane, "#W").strip()
+        if not win or win in EXEMPT:
+            continue
+        screen = sh("tmux", "capture-pane", "-p", "-t", pane)
+        if WAITING.search(screen) or has_draft(pane):
+            continue
+        sid, cwd = d.get("sessionId", "?"), d.get("cwd", "~")
+        line = (f"{time.strftime('%Y-%m-%d %H:%M')}  {win}  idle {idle_min:.0f}m  "
+                f"resume: cd {cwd} && claude --resume {sid}")
+        if DRY:
+            print("would close", line)
+            continue
+        panes = sh("tmux", "list-panes", "-t", pane, "-F", "#{pane_id}").split()
+        if len(panes) <= 1:
+            sh("tmux", "kill-window", "-t", pane)
+        else:
+            sh("tmux", "kill-pane", "-t", pane)
+        with open(LOG, "a") as fh:
+            fh.write(line + "\n")
+        print("closed", line)
+
+
+if __name__ == "__main__":
+    main()

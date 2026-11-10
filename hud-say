@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Pause Spotify if it's playing, speak the given text, then resume it.
+# Usage: hud-say "short status update"
+set -u
+text="${*:-}"
+[ -n "$text" ] || { echo "usage: hud-say TEXT" >&2; exit 2; }
+run="/run/user/$(id -u)"
+# One voice at a time: other callers wait their turn instead of overlapping.
+exec 9>"$run/hud-say.lock"
+flock -w 120 9 || exit 1
+
+dest=org.mpris.MediaPlayer2.spotify
+obj=/org/mpris/MediaPlayer2
+player=org.mpris.MediaPlayer2.Player
+
+status=$(gdbus call --session --dest "$dest" --object-path "$obj" \
+  --method org.freedesktop.DBus.Properties.Get "$player" PlaybackStatus 2>/dev/null)
+was_playing=0
+case "$status" in *Playing*) was_playing=1 ;; esac
+
+# Music mode: ~/.local/share/hud-listen/music-mode existing means "keep the
+# music playing, speak over it". Without the flag, Spotify pauses around the
+# spoken update as before.
+paused=0
+if [ "$was_playing" = 1 ] && [ ! -e "$HOME/.local/share/hud-listen/music-mode" ]; then
+  gdbus call --session --dest "$dest" --object-path "$obj" --method "$player.Pause" >/dev/null 2>&1
+  paused=1
+  sleep 0.7
+fi
+
+wav=$(mktemp --suffix=.wav)
+lock="$run/hud-speaking"
+touch "$lock"   # the listener ignores the mic while this exists
+trap 'rm -f "$wav" "$lock"' EXIT
+home="$HOME/.local/share/hud-listen"
+printf '%s' "$text" | "$home/venv/bin/python" -m piper \
+  --model "$home/voices/en_US-hfc_female-medium.onnx" --length-scale 1.1 --output_file "$wav" >/dev/null 2>&1 \
+  && paplay "$wav"
+rc=$?
+sleep 0.6
+rm -f "$lock"
+
+if [ "$paused" = 1 ]; then
+  sleep 0.5
+  gdbus call --session --dest "$dest" --object-path "$obj" --method "$player.Play" >/dev/null 2>&1
+fi
+exit $rc
