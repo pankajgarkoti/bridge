@@ -1,0 +1,7 @@
+[Unit]
+Description=Ask the orchestrator to summarize the last 3 hours of voice transcripts
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=%h/.local/bin/voice-digest-nudge

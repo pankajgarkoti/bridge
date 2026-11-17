@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Action items from the voice transcripts, into the daily note.
+
+Installed twice (symlinks), behaviour picked by the name it is called by:
+
+  voice-digest-nudge            run by voice-digest.timer every 3 hours. Tells the orchestrator
+                                (tmux window "orchestrator" + orch-bus) to start a summarizer for
+                                the transcripts since the last digest. Silent if nothing was heard.
+  voice-digest-run FROM TO      the summarizer. Reads the transcript slice [FROM, TO), asks
+                                `claude -p` for action items and appends them to the daily note
+                                under "# Tasks" as "## From voice (FROM–TO)". Updates last-digest.
+
+FROM and TO are ISO times, e.g. 2026-11-14T15:00+05:30 (no offset = IST).
+"""
+import fcntl
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
+HOME = pathlib.Path.home()
+STATE = HOME / ".local/state/voice"
+TRANSCRIPTS = pathlib.Path(os.environ.get("HUD_TRANSCRIPTS", STATE / "transcripts")).expanduser()
+LAST = STATE / "last-digest"
+NOTES = pathlib.Path(os.environ.get("VOICE_DIGEST_NOTES", HOME / "Desktop/notes")).expanduser()
+TEMPLATE = NOTES / "templates/daily.md"
+WINDOW = "orchestrator"
+PERIOD = timedelta(hours=3)
+MAX_SPAN = timedelta(hours=24)
+
+
+def parse_ts(s):
+    t = datetime.fromisoformat(s)
+    return t.replace(tzinfo=IST) if t.tzinfo is None else t.astimezone(IST)
+
+
+def fmt(t):
+    return t.isoformat(timespec="minutes")
+
+
+def last_digest():
+    try:
+        return parse_ts(LAST.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def set_last_digest(t):
+    STATE.mkdir(parents=True, exist_ok=True)
+    cur = last_digest()
+    if cur is None or t > cur:
+        tmp = LAST.with_suffix(".tmp")
+        tmp.write_text(fmt(t) + "\n")
+        tmp.replace(LAST)
+
+
+def entries(start, end):
+    out = []
+    day = start.date()
+    while day <= end.date():
+        f = TRANSCRIPTS / f"{day:%Y-%m-%d}.jsonl"
+        if f.exists():
+            for line in f.read_text().splitlines():
+                try:
+                    e = json.loads(line)
+                    if start <= parse_ts(e["ts"]) < end:
+                        out.append(e)
+                except (ValueError, KeyError):
+                    continue
+        day += timedelta(days=1)
+    return out
+
+
+def slice_path(start, end):
+    if start.date() == (end - timedelta(seconds=1)).date():
+        return str(TRANSCRIPTS / f"{start:%Y-%m-%d}.jsonl")
+    return str(TRANSCRIPTS) + "/"
+
+
+# ---------- nudge ----------
+def orchestrator_pane():
+    out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{window_name}"], capture_output=True, text=True).stdout
+    panes = [l.split("\t")[0] for l in out.splitlines() if l.split("\t")[-1] == WINDOW]
+    return panes[0] if len(panes) == 1 else None
+
+
+def nudge():
+    now = datetime.now(IST)
+    to = now.replace(minute=0, second=0, microsecond=0)
+    frm = last_digest() or (to - PERIOD)
+    frm = max(frm, to - MAX_SPAN)
+    if frm >= to:
+        print(f"nothing to do: last digest {fmt(frm)} >= {fmt(to)}")
+        return
+    n = len(entries(frm, to))
+    if n == 0:
+        set_last_digest(to)  # nothing heard: don't wake the orchestrator
+        print(f"no transcripts {fmt(frm)}–{fmt(to)}; last-digest moved to {fmt(to)}")
+        return
+    line = f"[voice-digest] Summarize voice transcripts {fmt(frm)}–{fmt(to)}: {slice_path(frm, to)}. Spawn a summarizer instance."
+    pane = orchestrator_pane()
+    if pane:
+        subprocess.run(["tmux", "send-keys", "-t", pane, "-l", line], check=False)
+        time.sleep(0.4)
+        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=False)
+    else:
+        print(f"no unique tmux window named {WINDOW!r}; bus only", file=sys.stderr)
+    subprocess.run(["orch-bus", "emit", "voice-digest", line], check=False)
+    print(f"nudged ({n} utterances): {line}")
+
+
+# ---------- run ----------
+PROMPT = """You extract action items from an always-on microphone transcript (Hindi, English and Hinglish; Hindi \
+may be in Devanagari, and English words spoken with an Indian accent may also appear in Devanagari). It is the \
+owner's room, so it contains the owner talking, phone calls, other people, and TV/video/background chatter.
+
+Return ONLY JSON: {{"items": ["...", ...]}}
+
+Rules:
+- An item is something the owner (or someone talking to the owner) said needs doing: a task, a reminder, a \
+promise, a payment, a call to make, a deadline. Write each as one short imperative English line.
+- Translate/summarize Hindi into English. Keep names, numbers, amounts, dates and times exactly as said.
+- Add the time it was said in brackets at the end, e.g. "(said 15:42)".
+- Skip noise, garbled fragments, TV/video/song audio, ads, and chatter that isn't a task. If unsure, skip.
+- No duplicates. If there are no real action items, return {{"items": []}}.
+
+Transcript {frm}–{to} (IST), one utterance per line as [time][language] text:
+{lines}
+"""
+
+
+def ask_claude(frm, to, es):
+    lines = "\n".join(f"[{parse_ts(e['ts']):%H:%M:%S}][{e.get('lang', '?')}] {e['text']}" for e in es)
+    prompt = PROMPT.format(frm=fmt(frm), to=fmt(to), lines=lines)
+    cmd = ["claude", "-p", "--output-format", "text", "--tools", "", "--no-session-persistence"]
+    if os.environ.get("VOICE_DIGEST_MODEL"):
+        cmd += ["--model", os.environ["VOICE_DIGEST_MODEL"]]
+    r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(f"claude -p failed ({r.returncode}): {r.stderr.strip()[:300]}")
+    m = re.search(r"\{.*\}", r.stdout, re.S)
+    if not m:
+        raise RuntimeError(f"no JSON in claude output: {r.stdout.strip()[:300]}")
+    items = json.loads(m.group(0)).get("items", [])
+    clean = []
+    for it in items:
+        if not isinstance(it, str):
+            continue
+        it = " ".join(it.split()).lstrip("-*[] xX").strip()
+        if it and it not in clean:
+            clean.append(it)
+    return clean
+
+
+def note_path(day):
+    return NOTES / f"Journal/{day:%Y}/{day:%m}/{day:%Y-%m-%d}.md"
+
+
+def heading(frm, to):
+    if frm.date() == (to - timedelta(seconds=1)).date():
+        return f"## From voice ({frm:%H:%M}–{to:%H:%M})"
+    return f"## From voice ({frm:%d %b %H:%M}–{to:%d %b %H:%M})"
+
+
+def insert_block(path, head, items):
+    """Insert the block at the end of the "# Tasks" section. Touches nothing else in the note."""
+    for _ in range(5):
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(TEMPLATE.read_text() if TEMPLATE.exists() else "# Tasks\n\n# Notes\n")
+        mtime = path.stat().st_mtime_ns
+        lines = path.read_text().split("\n")
+        if head in lines:
+            return False  # already added by an earlier run
+        block = [head, *[f"- [ ] {it}" for it in items]]
+        try:
+            i = lines.index("# Tasks")
+            end = next((j for j in range(i + 1, len(lines)) if lines[j].startswith("# ")), len(lines))
+            k = end
+            while k > i + 1 and lines[k - 1].strip() == "":
+                k -= 1
+            # after the section's last non-blank line; the blank lines before the next heading stay as they were
+            new = lines[:k] + [""] + block + lines[k:]
+        except ValueError:
+            new = lines + ["", "# Tasks", ""] + block + [""]
+        text = "\n".join(new)
+        if path.stat().st_mtime_ns != mtime:  # edited meanwhile (e.g. in the editor): retry
+            time.sleep(0.5)
+            continue
+        tmp = path.with_name(f".{path.name}.voice-digest.tmp")
+        tmp.write_text(text)
+        os.replace(tmp, path)
+        return True
+    raise RuntimeError(f"{path} kept changing; not written")
+
+
+def run(frm_s, to_s):
+    frm, to = parse_ts(frm_s), parse_ts(to_s)
+    if frm >= to:
+        sys.exit(f"FROM {fmt(frm)} must be before TO {fmt(to)}")
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock = open(STATE / "digest.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("another voice-digest-run is already running; exiting")
+        return
+    done = last_digest()
+    if done and done >= to:
+        print(f"already summarized up to {fmt(done)}; nothing to do")
+        return
+    es = entries(frm, to)
+    if not es:
+        set_last_digest(to)
+        print(f"no transcripts {fmt(frm)}–{fmt(to)}; last-digest = {fmt(to)}")
+        return
+    items = ask_claude(frm, to, es)
+    note = note_path((to - timedelta(seconds=1)).date())
+    head = heading(frm, to)
+    if items:
+        added = insert_block(note, head, items)
+        msg = f"{len(items)} action items from {len(es)} utterances -> {note} ({head[3:]})" if added else f"{head} already in {note}"
+    else:
+        msg = f"no action items in {len(es)} utterances {fmt(frm)}–{fmt(to)}; note untouched"
+    set_last_digest(to)
+    print(msg)
+    for it in items:
+        print(f"  - [ ] {it}")
+    subprocess.run(["orch-bus", "emit", "voice-digest", f"done: {msg}"], check=False)
+
+
+def main():
+    name = os.path.basename(sys.argv[0])
+    args = sys.argv[1:]
+    if name.endswith("-nudge") or args[:1] == ["nudge"]:
+        nudge()
+    elif name.endswith("-run") or args[:1] == ["run"]:
+        args = args[1:] if args[:1] == ["run"] else args
+        if len(args) != 2:
+            sys.exit("usage: voice-digest-run FROM TO   (ISO times, e.g. 2026-11-14T15:00+05:30)")
+        run(*args)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

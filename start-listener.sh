@@ -15,7 +15,7 @@ cd "$HOME/.local/share/hud-listen" || { echo "Run setup.sh first." >&2; exit 1; 
 
 keep_awake=()
 command -v systemd-inhibit >/dev/null &&
-  keep_awake=(systemd-inhibit --what=idle:sleep:handle-lid-switch --who=hud-listen --why=listening)
+  keep_awake=(systemd-inhibit --what=idle --who=hud-listen --why=listening)
 
 echo "Mic: ${HUD_SOURCE:-laptop mic}. Sending to: $HUD_TARGET"
 while true; do
