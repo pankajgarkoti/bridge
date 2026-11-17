@@ -1,0 +1,16 @@
+[Unit]
+Description=Voice listener: mic -> on-device STT (Hindi + English) -> ~/.local/state/voice/transcripts
+After=pipewire.service wireplumber.service
+
+[Service]
+WorkingDirectory=%h/.local/share/hud-listen
+# Old behaviour (type every utterance into the orchestrator): add a drop-in with
+#   Environment=HUD_TYPE_TO_ORCH=1
+#   Environment=HUD_TARGET==work:=orchestrator
+ExecStart=/usr/bin/systemd-inhibit --what=idle --who=hud-listen --why=listening %h/.local/share/hud-listen/venv/bin/python -u listen.py
+Nice=5
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
